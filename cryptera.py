@@ -355,14 +355,16 @@ async def check_subscription(user_id: int) -> bool:
         return False
 
 SYSTEM_PROMPT_QA = f"""You are an expert AI assistant specializing exclusively in cryptocurrency and blockchain technology for the channel '{CHANNEL_ID}'.
-Answer the user's questions concisely and accurately, focusing only on crypto-related aspects.
-Politely decline questions unrelated to crypto.
+Answer the user's questions concisely and accurately, focusing ONLY on crypto-related aspects.
+IMPORTANT: You must STRICTLY REFUSE to answer ANY questions not directly related to cryptocurrency or blockchain. 
+For unrelated topics, politely state that you can only provide information about cryptocurrency and blockchain.
 **If you need the current price of a cryptocurrency, use the placeholder `{{PRICE:SYMBOL}}` (e.g., `{{PRICE:BTC}}`, `{{PRICE:ETH}}`). Do not invent prices.**
 If the user's question is about a very basic, fundamental, or commonly discussed topic in crypto, append the exact marker '{COMMON_TOPIC_MARKER}' at the VERY END of your response.
 Provide only the direct answer, without any extra commentary or meta-tags like <think>. Consider the provided conversation history for context.
 Use Markdown formatting with *bold* and _italic_ only. **Do NOT use** `**bold**` or `__italic__`.
 
 IMPORTANT: Always respond in Russian language only, regardless of the language of the question.
+NEVER answer questions about general topics, politics, world events, celebrities, or any other non-crypto themes.
 """
 
 SYSTEM_PROMPT_POST = f"""You are an expert AI writer for the crypto channel '{CHANNEL_ID}'.
@@ -469,8 +471,13 @@ async def cmd_publish_start(message: types.Message, state: FSMContext):
     await state.set_state(PublishPost.waiting_for_topic)
     await message.reply("Введите тему для нового поста в канале:")
 
-@dp.message(PublishPost.waiting_for_topic, F.text)
+@dp.message(PublishPost.waiting_for_topic)
 async def process_publish_topic(message: types.Message, state: FSMContext):
+    # Проверяем, что сообщение содержит текст
+    if not message.text:
+        logging.warning(f"Получено сообщение без текста в состоянии waiting_for_topic")
+        return
+
     if not message.from_user or message.from_user.id not in ADMIN_USER_IDS:
         logging.warning(f"Сообщение в состоянии waiting_for_topic от не-админов {message.from_user.id}, сброс состояния.")
         await state.clear()
@@ -517,32 +524,25 @@ async def generate_and_confirm_post(message_or_callback: types.Message | Callbac
 
     try:
         logging.info(f"Вызов AI для генерации поста по теме: '{topic}'")
-        openrouter_url = "https://openrouter.ai/api/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": "google/gemini-2.0-flash-exp:free",
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT_POST},
-                {"role": "user", "content": topic}
-            ],
-            "temperature": 0.7,
-            "top_p": 0.9
-        }
         
-        # Вызываем API с учетом ограничений на частоту запросов
-        response = await call_api_with_rate_limit(openrouter_url, headers, payload)
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT_POST},
+            {"role": "user", "content": topic}
+        ]
         
-        if response is None:
-            # Если не удалось получить ответ после всех попыток
+        # Используем функцию с SambaNova API
+        post_content_raw = await call_api_with_fallback(
+            messages=messages,
+            temperature=0.7,
+            top_p=0.9
+        )
+        
+        if post_content_raw is None:
+            # Если не удалось получить ответ
             await processing_msg.edit_text("В данный момент AI-сервис перегружен. Попробуйте позже или повторите запрос через несколько минут.")
             await state.clear()
             return
             
-        response_data = response.json()
-        post_content_raw = response_data['choices'][0]['message']['content']
         logging.info(f"Сырой ответ AI для поста: {post_content_raw}")
 
         post_content_fixed_md = fix_markdown(post_content_raw)
@@ -589,12 +589,8 @@ async def generate_and_confirm_post(message_or_callback: types.Message | Callbac
                  raise e
 
     except requests.exceptions.RequestException as e:
-        logging.error(f"Ошибка сети/HTTP при обращении к OpenRouter API: {e}")
+        logging.error(f"Ошибка сети/HTTP при обращении к AI: {e}")
         await processing_msg.edit_text(f"Ошибка сети при обращении к AI: {e}. /cancel")
-        await state.clear()
-    except (json.JSONDecodeError, KeyError, IndexError) as e:
-        logging.error(f"Ошибка обработки ответа от OpenRouter API: {e}. Ответ: {response.text if 'response' in locals() else 'N/A'}")
-        await processing_msg.edit_text(f"Ошибка обработки ответа AI. /cancel")
         await state.clear()
     except Exception as e:
         logging.error(f"Неожиданная ошибка в generate_and_confirm_post: {e}", exc_info=True)
@@ -684,9 +680,13 @@ async def handle_confirmation_callback(callback: CallbackQuery, state: FSMContex
 
         await state.clear()
 
-# --- >>> Обработчик инструкций по редактированию (обновлен) <<< ---
-@dp.message(PublishPost.waiting_for_edit_instructions, F.text)
+@dp.message(PublishPost.waiting_for_edit_instructions)
 async def handle_edit_instructions(message: types.Message, state: FSMContext):
+    # Проверяем, что сообщение содержит текст
+    if not message.text:
+        logging.warning(f"Получено сообщение без текста в состоянии waiting_for_edit_instructions")
+        return
+        
     if not message.from_user or message.from_user.id not in ADMIN_USER_IDS: return
 
     edit_instructions = message.text.strip()
@@ -718,31 +718,24 @@ async def handle_edit_instructions(message: types.Message, state: FSMContext):
         )
 
         logging.info(f"Вызов AI для редактирования поста.")
-        openrouter_url = "https://openrouter.ai/api/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": "google/gemini-2.0-flash-exp:free",
-            "messages": [
-                 # Примечание: Системный промпт уже включен в edit_prompt
-                {"role": "user", "content": edit_prompt}
-            ],
-            "temperature": 0.5,
-            "top_p": 0.9
-        }
         
-        # Вызываем API с учетом ограничений на частоту запросов
-        response = await call_api_with_rate_limit(openrouter_url, headers, payload)
+        messages = [
+            # Примечание: Системный промпт уже включен в edit_prompt
+            {"role": "user", "content": edit_prompt}
+        ]
         
-        if response is None:
-            # Если не удалось получить ответ после всех попыток
+        # Используем функцию с SambaNova API
+        edited_content_raw = await call_api_with_fallback(
+            messages=messages,
+            temperature=0.5,
+            top_p=0.9
+        )
+        
+        if edited_content_raw is None:
+            # Если не удалось получить ответ
             await processing_msg.edit_text("В данный момент AI-сервис перегружен. Попробуйте редактирование позже или /cancel для отмены.")
             return
             
-        response_data = response.json()
-        edited_content_raw = response_data['choices'][0]['message']['content']
         logging.info(f"Сырой ответ AI после редактирования: {edited_content_raw}")
 
         # --- >>> Обработка Markdown и цен ПОСЛЕ редактирования <<< ---
@@ -789,12 +782,8 @@ async def handle_edit_instructions(message: types.Message, state: FSMContext):
                  raise e # Переброс других ошибок Telegram
 
     except requests.exceptions.RequestException as e:
-        logging.error(f"Ошибка сети/HTTP при обращении к OpenRouter API (редактирование): {e}")
+        logging.error(f"Ошибка сети/HTTP при обращении к AI: {e}")
         await processing_msg.edit_text(f"Ошибка сети при обращении к AI: {e}. Попробуйте еще раз или /cancel.")
-    except (json.JSONDecodeError, KeyError, IndexError) as e:
-        logging.error(f"Ошибка обработки ответа от OpenRouter API (редактирование): {e}. Ответ: {response.text if 'response' in locals() else 'N/A'}")
-        await processing_msg.edit_text("Ошибка обработки ответа AI. Попробуйте /cancel.")
-        # Не очищаем состояние, даем шанс вернуться к предыдущей версии
     except Exception as e:
         logging.error(f"Неожиданная ошибка в handle_edit_instructions: {e}", exc_info=True)
         await processing_msg.edit_text("Ошибка при редактировании. Попробуйте /cancel.")
@@ -817,7 +806,42 @@ async def handle_proceed_publish(callback: CallbackQuery, state: FSMContext):
     await generate_and_confirm_post(callback, state, topic)
 
 
-# 4. Основной хендлер для текста
+# Перемещаю функцию call_api_with_fallback с позиции 1003 перед функцию handle_text
+
+async def call_api_with_fallback(messages, temperature=0.6, top_p=0.9):
+    """Вызывает API SambaNova для получения ответа от модели DeepSeek.
+    
+    Args:
+        messages: Список сообщений для отправки в API
+        temperature: Параметр температуры для генерации
+        top_p: Параметр top_p для генерации
+        
+    Returns:
+        Сгенерированный ответ или None при неудаче API
+    """
+    
+    # Используем только SambaNova API с моделью DeepSeek
+    logging.info("Используем SambaNova API с моделью DeepSeek...")
+    try:
+        sambanova_client = openai.OpenAI(
+            api_key=SAMBANOVA_API_KEY,
+            base_url="https://api.sambanova.ai/v1"
+        )
+        
+        response = sambanova_client.chat.completions.create(
+            model="DeepSeek-R1",
+            messages=messages,
+            temperature=temperature,
+            top_p=top_p
+        )
+        
+        content = response.choices[0].message.content
+        logging.info("Успешно получен ответ от SambaNova API")
+        return content
+    except Exception as e:
+        logging.error(f"Ошибка при обращении к SambaNova API: {e}")
+        return None
+
 @dp.message(F.text)
 async def handle_text(message: types.Message, state: FSMContext):
     current_state = await state.get_state()
@@ -903,32 +927,20 @@ async def handle_text(message: types.Message, state: FSMContext):
     messages_for_api = [{"role": "system", "content": SYSTEM_PROMPT_QA}] + list(user_context[user_id])
 
     try:
-        # ВЫЗОВ AI
-        openrouter_url = "https://openrouter.ai/api/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": "google/gemini-2.0-flash-exp:free",
-            "messages": messages_for_api, # Используем подготовленный список с историей
-            "temperature": 0.6,
-            "top_p": 0.9
-        }
+        # ВЫЗОВ AI с использованием SambaNova API
+        ai_response_raw = await call_api_with_fallback(
+            messages=messages_for_api,
+            temperature=0.6,
+            top_p=0.9
+        )
         
-        # Вызываем API с учетом ограничений на частоту запросов
-        response = await call_api_with_rate_limit(openrouter_url, headers, payload)
-        
-        if response is None:
-            # Если не удалось получить ответ после всех попыток
+        if ai_response_raw is None:
+            # Если не удалось получить ответ
             await message.reply("В данный момент AI-сервис перегружен. Пожалуйста, попробуйте позже.")
             if user_id in user_context and user_context[user_id] and user_context[user_id][-1]["role"] == "user":
                 user_context[user_id].pop()
             return
-            
-        response_data = response.json()
-        ai_response_raw = response_data['choices'][0]['message']['content']
-
+        
         logging.info(f"Ответ AI (QA) для {user_id}: {ai_response_raw}")
         logging.debug(f"[PRICE DEBUG] Сырой ответ AI перед обработкой цен: {ai_response_raw}") # <-- DEBUG LOG
 
@@ -997,16 +1009,13 @@ async def handle_text(message: types.Message, state: FSMContext):
 
 
     except requests.exceptions.RequestException as e:
-        logging.error(f"Ошибка сети/HTTP при обращении к OpenRouter API (QA): {e}")
+        logging.error(f"Ошибка сети/HTTP при обращении к AI: {e}")
         await message.reply(f"В данный момент наблюдаются проблемы с доступом к AI (сеть). Попробуйте позже.")
         if user_id in user_context and user_context[user_id] and user_context[user_id][-1]["role"] == "user": user_context[user_id].pop()
-    except (json.JSONDecodeError, KeyError, IndexError) as e:
-        logging.error(f"Ошибка обработки ответа от OpenRouter API (QA): {e}. Ответ: {response.text if 'response' in locals() else 'N/A'}")
-        await message.reply(f"Произошла ошибка при обработке ответа AI. Попробуйте позже.")
+    except Exception as e:
+        logging.error(f"Неожиданная ошибка в handle_text: {e}", exc_info=True)
+        await message.reply(f"Произошла ошибка при обработке запроса. Попробуйте позже.")
         if user_id in user_context and user_context[user_id] and user_context[user_id][-1]["role"] == "user": user_context[user_id].pop()
-    except (TelegramBadRequest, AiogramError) as e:
-        # Обработка ошибок Telegram/Aiogram, не связанных с парсингом Markdown (они обрабатываются выше)
-        logging.error(f"Неожиданная ошибка Telegram/Aiogram в handle_text: {e}", exc_info=True)
 
 
 async def on_new_channel_post(client, message):
@@ -1098,15 +1107,17 @@ async def main():
             logging.error(f"Нет доступа к группе обсуждения {DISCUSSION_GROUP_ID}: {e}")
             logging.warning("Автоматические ответы в группе обсуждения могут не работать!")
 
-    # Регистрируем обработчики
+    # Регистрируем обработчики в правильном порядке
     dp.message.register(send_welcome, Command(commands=['start', 'help']))
     dp.message.register(cancel_handler, Command('cancel'), F.state != None)
     dp.message.register(cancel_no_state_handler, Command('cancel'), F.state == None)
     dp.message.register(cmd_limit_on, Command('limiton'))
     dp.message.register(cmd_limit_off, Command('limitoff'))
     dp.message.register(cmd_publish_start, Command(commands=['publish']))
-    dp.message.register(process_publish_topic, PublishPost.waiting_for_topic, F.text)
-    dp.message.register(handle_edit_instructions, PublishPost.waiting_for_edit_instructions, F.text)
+    
+    # Обработчики состояний должны идти перед общим текстовым обработчиком
+    dp.message.register(process_publish_topic, PublishPost.waiting_for_topic)
+    dp.message.register(handle_edit_instructions, PublishPost.waiting_for_edit_instructions)
     
     # Обработчик для новых постов в канале
     dp.message.register(on_new_channel_post, lambda msg: msg.chat and msg.chat.type == "channel" and msg.chat.id == CHANNEL_ID)
@@ -1117,9 +1128,11 @@ async def main():
         lambda msg: msg.chat and msg.chat.id == DISCUSSION_GROUP_ID and msg.text and not msg.text.startswith('/')
     )
     
-    # Остальные обработчики
+    # Callback обработчики
     dp.callback_query.register(handle_confirmation_callback, PublishPost.waiting_for_confirmation, F.data.startswith("publish_post_"))
     dp.callback_query.register(handle_proceed_publish, F.data.startswith("proceed_publish:"))
+    
+    # Общий обработчик текста должен идти последним
     dp.message.register(handle_text, F.text)
 
     # Сброс вебхука и старт поллинга
@@ -1141,65 +1154,6 @@ if __name__ == '__main__':
         logging.error(f"Критическая ошибка конфигурации: {e}")
     except Exception as e:
         logging.error(f"Критическая ошибка при запуске или работе бота: {e}", exc_info=True)
-
-async def call_api_with_fallback(messages, temperature=0.6, top_p=0.9):
-    """Вызывает API с основным провайдером (OpenRouter), а при ошибке использует запасной (SambaNova).
-    
-    Args:
-        messages: Список сообщений для отправки в API
-        temperature: Параметр температуры для генерации
-        top_p: Параметр top_p для генерации
-        
-    Returns:
-        Сгенерированный ответ или None при неудаче обоих API
-    """
-    
-    # Сначала пробуем OpenRouter API
-    openrouter_url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": "google/gemini-2.0-flash-exp:free",
-        "messages": messages,
-        "temperature": temperature,
-        "top_p": top_p
-    }
-    
-    response = await call_api_with_rate_limit(openrouter_url, headers, payload)
-    
-    if response is not None:
-        try:
-            response_data = response.json()
-            content = response_data['choices'][0]['message']['content']
-            logging.info("Успешно получен ответ от OpenRouter API")
-            return content
-        except Exception as e:
-            logging.error(f"Ошибка при обработке ответа OpenRouter: {e}")
-            # Продолжаем с запасным API
-    
-    # Если не удалось получить ответ от OpenRouter, пробуем SambaNova
-    logging.info("Переключаемся на SambaNova API...")
-    try:
-        sambanova_client = openai.OpenAI(
-            api_key=SAMBANOVA_API_KEY,
-            base_url="https://api.sambanova.ai/v1"
-        )
-        
-        response = sambanova_client.chat.completions.create(
-            model="DeepSeek-R1",
-            messages=messages,
-            temperature=temperature,
-            top_p=top_p
-        )
-        
-        content = response.choices[0].message.content
-        logging.info("Успешно получен ответ от SambaNova API")
-        return content
-    except Exception as e:
-        logging.error(f"Ошибка при обращении к SambaNova API: {e}")
-        return None
 
 async def process_message_command(message, command_args):
     """Обрабатывает команду /message и отправляет запрос к API."""
@@ -1236,7 +1190,10 @@ async def process_message_command(message, command_args):
         {"role": "system", "content": "Ты - ИИ-ассистент по криптовалютам и блокчейну. "
                                       "Отвечай глубоко, содержательно и только на русском языке. "
                                       "Не используй смайлики. Твои ответы должны быть написаны понятным языком без излишнего формализма. "
-                                      "Объясняй сложные технические концепции простыми словами."},
+                                      "Объясняй сложные технические концепции простыми словами."
+                                      "ВАЖНО: Ты ДОЛЖЕН СТРОГО ОТКАЗЫВАТЬСЯ отвечать на ЛЮБЫЕ вопросы, не связанные напрямую с криптовалютами или блокчейном. "
+                                      "На не связанные темы вежливо сообщай, что можешь предоставлять информацию ТОЛЬКО о криптовалютах и блокчейне. "
+                                      "НИКОГДА не отвечай на вопросы об общих темах, политике, мировых событиях, знаменитостях или любых других не-крипто темах."},
         {"role": "user", "content": query}
     ]
     
